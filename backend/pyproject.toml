@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cad-view-geometry-api"
+version = "0.1.0"
+description = "Traceable mesh ingestion and qualification API"
+requires-python = ">=3.10"
+dependencies = [
+    "cadquery",
+    "fastapi",
+    "imageio-ffmpeg",
+    "mapbox-earcut",
+    "networkx",
+    "numpy",
+    "pillow",
+    "python-multipart",
+    "rtree",
+    "shapely",
+    "trimesh",
+    "fast_simplification",
+    "uvicorn[standard]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx",
+    "pytest",
+]
+vision = [
+    "torch",
+    "torchvision",
+    "transformers",
+    "einops",
+    "huggingface_hub",
+    "safetensors",
+    "scikit-image",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+py-modules = [
+    "main",
+    "camera_intrinsics",
+    "neural_reconstruction",
+    "parametric_reconstruction",
+    "primitive_fitting",
+    "reconstruction",
+    "segmentation",
+]
