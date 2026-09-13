@@ -94,7 +94,7 @@ Photo/video meshes are labeled `photogrammetry / unscaled` and must receive a ph
 ```powershell
 cd backend
 python -m venv .venv
-.\venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 pip install -e ".[dev,vision]"
 uvicorn main:app --reload
 ```
