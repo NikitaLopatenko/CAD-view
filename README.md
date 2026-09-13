@@ -1,16 +1,16 @@
 # CAD-View
 
-**Photos and meshes in. Editable SolidWorks feature trees out — with honesty about what was measured vs inferred.**
+**Photos and meshes in. Editable SolidWorks feature trees out - with honesty about what was measured vs inferred.**
 
 CAD-View is a local reverse-engineering pipeline: qualify scanned or reconstructed geometry, recover parametric features when the evidence supports it, and export a native SolidWorks history instead of a dumb solid.
 
-[![Demo video](demo/nasal-spray-base/gallery/07-mesh-vs-cad-overlay.png)](demo/nasal-spray-base/cadview-nasal-spray-demo.mp4)
+![CAD-View nasal-spray demo](demo/nasal-spray-base/gallery/cadview-nasal-spray-demo.gif)
 
-*Click the image to open the nasal-spray demo video (`demo/nasal-spray-base/cadview-nasal-spray-demo.mp4`), or browse the [gallery](demo/nasal-spray-base/gallery/).*
+*Animated walkthrough (GIF - GitHub does not play MP4 inline). Still frames and the source MP4 are in [`demo/nasal-spray-base/`](demo/nasal-spray-base/); browse the [gallery](demo/nasal-spray-base/gallery/).*
 
 ## Demo: nasal spray bottle
 
-Physical part → observed mesh → scored revolve → editable feature tree.
+Physical part -> observed mesh -> scored revolve -> editable feature tree.
 
 | Step | Preview |
 | --- | --- |
@@ -21,23 +21,24 @@ Physical part → observed mesh → scored revolve → editable feature tree.
 | Recovered revolve | ![Recovered revolve](demo/nasal-spray-base/gallery/06-recovered-revolve.png) |
 | Mesh vs CAD overlay | ![Overlay](demo/nasal-spray-base/gallery/07-mesh-vs-cad-overlay.png) |
 
-**Result on this part:** native revolve about the long axis, volume error ≈ **1.8%**, IoU ≈ **0.906**, 13-point profile sketch. The previous default extrude path was ≈ **47.6%** volume error on the same mesh.
+**Result on this part:** native revolve about the long axis, volume error ~ **1.8%**, IoU ~ **0.906**, 13-point profile sketch. The previous default extrude path was ~ **47.6%** volume error on the same mesh.
 
 Assets live under [`demo/nasal-spray-base/`](demo/nasal-spray-base/):
 
-- `input-photo.png` / `gallery-bottle-photo.jpg` — capture reference
-- `reconstruction-60k.stl` — observed mesh used in the demo
-- `recovered-revolve.stl` — solid recovered from the winning revolve
-- `parametric-revolve.vbs` — builds Sketch + Revolve1 in SolidWorks
-- `cadview-nasal-spray-demo.mp4` — ~25s gallery walkthrough
-- `make_gallery.py` — regenerates renders + video
+- `input-photo.png` / `gallery-bottle-photo.jpg` - capture reference
+- `reconstruction-60k.stl` - observed mesh used in the demo
+- `recovered-revolve.stl` - solid recovered from the winning revolve
+- `parametric-revolve.vbs` - builds Sketch + Revolve1 in SolidWorks
+- `cadview-nasal-spray-demo.mp4` - source MP4 walkthrough
+- `gallery/cadview-nasal-spray-demo.gif` - README-friendly animated demo
+- `make_gallery.py` / `make_gif.py` - regenerates renders + video/GIF
 
 ## What it does
 
-1. **Capture → observed mesh** — Meshroom/AliceVision photogrammetry, with VGGT + masked TSDF fusion as a neural rescue path. Human-reviewed SAM masks keep background out of densification.
-2. **Qualify the mesh** — Immutable source bytes + SHA-256 provenance, watertightness / winding / components / Euler diagnostics, physical scale from a two-point constraint, and check dimensions with pass/fail tolerances.
-3. **Recover editable CAD** — Competing hypotheses (extrude vs revolve about principal axes, cam-style sweep cuts, residual bosses/cuts/radial holes, revolved cuts) are scored against the mesh, then compiled through a typed .NET SolidWorks bridge (VBScript fallback for simpler ops).
-4. **Export with receipts** — Qualified meshes, STEP (analytic or faceted), SolidWorks scripts/parts, and machine-readable quality reports.
+1. **Capture -> observed mesh** - Meshroom/AliceVision photogrammetry, with VGGT + masked TSDF fusion as a neural rescue path. Human-reviewed SAM masks keep background out of densification.
+2. **Qualify the mesh** - Immutable source bytes + SHA-256 provenance, watertightness / winding / components / Euler diagnostics, physical scale from a two-point constraint, and check dimensions with pass/fail tolerances.
+3. **Recover editable CAD** - Competing hypotheses (extrude vs revolve about principal axes, cam-style sweep cuts, residual bosses/cuts/radial holes, revolved cuts) are scored against the mesh, then compiled through a typed .NET SolidWorks bridge (VBScript fallback for simpler ops).
+4. **Export with receipts** - Qualified meshes, STEP (analytic or faceted), SolidWorks scripts/parts, and machine-readable quality reports.
 
 ## Pipeline
 
@@ -99,7 +100,7 @@ pip install -e ".[dev,vision]"
 uvicorn main:app --reload
 ```
 
-API: `http://127.0.0.1:8000` · OpenAPI: `http://127.0.0.1:8000/docs`
+API: `http://127.0.0.1:8000` - OpenAPI: `http://127.0.0.1:8000/docs`
 
 ### Web application
 
@@ -119,6 +120,7 @@ Requires a licensed SolidWorks install, COM API registration, and .NET 9. If the
 
 ```powershell
 backend\.venv\Scripts\python.exe demo\nasal-spray-base\make_gallery.py
+backend\.venv\Scripts\python.exe demo\nasal-spray-base\make_gif.py
 ```
 
 ### Meshroom
