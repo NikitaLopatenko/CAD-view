@@ -14,6 +14,12 @@ import trimesh
 from shapely import affinity
 from shapely.geometry import LineString, Point, Polygon
 
+from solid_agreement import (
+    canonical_mesh,
+    evaluate_candidate,
+    stacked_extrusion_solid,
+)
+
 LengthUnit = Literal["mm", "cm", "m", "in"]
 
 UNIT_TO_METERS: dict[LengthUnit, float] = {
@@ -547,77 +553,14 @@ def _curvature_segmentation_evidence(
     }
 
 
-def _source_to_cad_deviation(
-    mesh: trimesh.Trimesh,
-    *,
-    center: np.ndarray,
-    axes: np.ndarray,
-    extrusion_index: int,
-    axial_low: float,
-    components: list[tuple[Polygon, float, float]],
-) -> dict[str, float | int | None]:
-    try:
-        solids: list[trimesh.Trimesh] = []
-        for polygon, depth, start_offset in components:
-            solid = trimesh.creation.extrude_polygon(
-                polygon,
-                height=depth,
-                engine="earcut",
-            )
-            solid.apply_translation([0.0, 0.0, start_offset])
-            solids.append(solid)
-        reconstructed = trimesh.util.concatenate(solids)
-
-        points = np.vstack(
-            (
-                np.asarray(mesh.vertices, dtype=np.float64),
-                np.asarray(mesh.triangles_center, dtype=np.float64),
-            )
-        )
-        if len(points) > 20_000:
-            indices = np.linspace(0, len(points) - 1, 20_000, dtype=np.int64)
-            points = points[indices]
-
-        local = (points - center) @ axes
-        planar_indices = [
-            index for index in range(3) if index != extrusion_index
-        ]
-        canonical = np.column_stack(
-            (
-                local[:, planar_indices[0]],
-                local[:, planar_indices[1]],
-                local[:, extrusion_index] - axial_low,
-            )
-        )
-        _, distances, _ = trimesh.proximity.closest_point(
-            reconstructed, canonical
-        )
-        finite = distances[np.isfinite(distances)]
-        if len(finite) == 0:
-            raise ValueError("No finite deviation samples.")
-        return {
-            "sample_count": int(len(finite)),
-            "mean": float(np.mean(finite)),
-            "rms": float(np.sqrt(np.mean(np.square(finite)))),
-            "p95": float(np.percentile(finite, 95)),
-            "max": float(np.max(finite)),
-        }
-    except (ImportError, ValueError, RuntimeError):
-        return {
-            "sample_count": 0,
-            "mean": None,
-            "rms": None,
-            "p95": None,
-            "max": None,
-        }
-
-
 def build_prismatic_recipe(
     mesh: trimesh.Trimesh,
     unit: LengthUnit,
     *,
     simplify_ratio: float = 0.001,
     section_count: int = 25,
+    extrusion_index: int | None = None,
+    include_residual_regions: bool = False,
 ) -> dict[str, object]:
     """
     Recover an editable feature recipe from a mostly prismatic mesh.
@@ -626,6 +569,11 @@ def build_prismatic_recipe(
     center slice misses. The groove is represented as a full outer extrude plus
     a native cut of the recovered ring; diagnostics retain the sweep path for
     future constant-profile Sweep-Cut generation.
+
+    `extrusion_index` forces a PCA axis to extrude along. Left unset it falls
+    back to the thinnest axis, which is right for plate-like parts and wrong
+    for anything tall, so callers that can compare hypotheses should pass each
+    axis explicitly and keep whichever scores best.
     """
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
         raise ParametricReconstructionError(
@@ -636,7 +584,12 @@ def build_prismatic_recipe(
     center, axes = _right_handed_pca(vertices)
     local = (vertices - center) @ axes
     spans = np.ptp(local, axis=0)
-    extrusion_index = int(np.argmin(spans))
+    if extrusion_index is None:
+        extrusion_index = int(np.argmin(spans))
+    if extrusion_index not in (0, 1, 2):
+        raise ParametricReconstructionError(
+            f"Extrusion axis index must be 0, 1 or 2 (got {extrusion_index})."
+        )
     other = [index for index in range(3) if index != extrusion_index]
     axial_low = float(local[:, extrusion_index].min())
     axial_high = float(local[:, extrusion_index].max())
@@ -787,6 +740,19 @@ def build_prismatic_recipe(
             sweep_profile_sketch["plane"] = "Top Plane"
             path_points = list(sweep_analysis["path_points"])
             path_length = float(LineString(path_points).length)
+            transformed_core = _transform_planar_polygon(
+                core_polygon, rotation, translation_y
+            )
+            fallback_region = transformed_side.difference(transformed_core)
+            if fallback_region.geom_type == "MultiPolygon":
+                fallback_region = max(
+                    fallback_region.geoms, key=lambda item: item.area
+                )
+            fallback_sketch, _ = _profile_sketch(
+                fallback_region,
+                name="CADView Sweep Fallback Cut",
+                tolerance=tolerance,
+            )
             features = [
                 {
                     "id": "base-extrude-1",
@@ -812,6 +778,15 @@ def build_prismatic_recipe(
                         "kind": "polyline",
                         "points": path_points,
                         "closed": False,
+                    },
+                    "fallback": {
+                        "name": "CADView Perimeter Groove Cut",
+                        "type": "cut",
+                        "depth": groove_width,
+                        "start_offset": 0.0,
+                        "end_condition": "midplane",
+                        "role": "perimeter_groove_cut_fallback",
+                        "sketch": fallback_sketch,
                     },
                 },
             ]
@@ -952,20 +927,31 @@ def build_prismatic_recipe(
         if source_volume
         else None
     )
-    confidence = max(0.0, 1.0 - min(thinness_ratio, 1.0))
+    # Kept only as a diagnostic. It scores how plate-like the mesh is, which is
+    # unrelated to whether the recovered features actually match it: a perfectly
+    # recovered cylinder used to report zero confidence under this formula.
+    thinness_confidence = max(0.0, 1.0 - min(thinness_ratio, 1.0))
     if volume_error_percent is not None:
-        confidence *= max(0.0, 1.0 - min(volume_error_percent / 100.0, 1.0))
+        thinness_confidence *= max(
+            0.0, 1.0 - min(volume_error_percent / 100.0, 1.0)
+        )
     if groove_detected:
-        confidence *= max(0.0, 1.0 - min(side_symmetry_error, 1.0))
+        thinness_confidence *= max(0.0, 1.0 - min(side_symmetry_error, 1.0))
 
-    deviation = _source_to_cad_deviation(
-        mesh,
-        center=center,
-        axes=axes,
-        extrusion_index=extrusion_index,
-        axial_low=axial_low,
-        components=components,
+    agreement = evaluate_candidate(
+        canonical_mesh(
+            mesh,
+            center=center,
+            axes=axes,
+            axial_index=extrusion_index,
+            axial_low=axial_low,
+        ),
+        stacked_extrusion_solid(components),
+        detail=f"{strategy} about PCA axis {extrusion_index}",
+        include_residual_regions=include_residual_regions,
     )
+    deviation = agreement.deviation
+    confidence = agreement.score
     curvature_evidence = _curvature_segmentation_evidence(
         mesh,
         center=center,
@@ -1021,6 +1007,7 @@ def build_prismatic_recipe(
             "extrusion_axis_index": extrusion_index,
             "extrusion_axis_world": [float(value) for value in normal],
             "thinness_ratio": float(thinness_ratio),
+            "thinness_confidence": float(thinness_confidence),
             "profile_area": profile_area,
             "side_profile_area": side_area,
             "section_variation_fraction": float(variation_fraction),
@@ -1048,6 +1035,7 @@ def build_prismatic_recipe(
                 "orthogonal_section_analysis": sweep_analysis,
             },
             "curvature_segmentation": curvature_evidence,
+            "agreement": agreement.as_dict(),
             "deviation": deviation,
             "reconstructed_volume": reconstructed_volume,
             "source_volume": source_volume,
@@ -1106,10 +1094,11 @@ def build_solidworks_part(
         )
 
     features = recipe.get("features", [])
-    allowed = {"extrude", "cut", "sweep_cut"}
+    allowed = {"extrude", "cut", "sweep_cut", "revolve", "revolve_cut"}
     if not features or any(feature.get("type") not in allowed for feature in features):
         raise ParametricReconstructionError(
-            "The SolidWorks builder requires native extrude/cut/sweep features."
+            "The SolidWorks builder requires native "
+            "extrude/cut/sweep/revolve/revolve-cut features."
         )
     if recipe.get("unit") not in UNIT_TO_METERS:
         raise ParametricReconstructionError(
@@ -1185,10 +1174,11 @@ def write_solidworks_builder_script(
 ) -> None:
     """Write an interactive VBScript that builds native SolidWorks features."""
     features = recipe.get("features", [])
-    allowed = {"extrude", "cut", "sweep_cut"}
+    allowed = {"extrude", "cut", "sweep_cut", "revolve", "revolve_cut"}
     if not features or any(feature.get("type") not in allowed for feature in features):
         raise ParametricReconstructionError(
-            "The SolidWorks script requires native extrude/cut/sweep features."
+            "The SolidWorks script requires native "
+            "extrude/cut/sweep/revolve/revolve-cut features."
         )
     unit = recipe.get("unit")
     if unit not in UNIT_TO_METERS:
@@ -1201,6 +1191,7 @@ def write_solidworks_builder_script(
         "Dim template, scriptFolder, outputFile, errors, warnings, savedStatus",
         "Dim autoRelationsOriginal, selected, segmentIndex, createdCount, featureIndex",
         "Dim logFile, fso, stamp, sketchIndex, candidateFeature, splinePoints",
+        "Dim axisSegment, selectionData, fallbackUsed",
         "On Error Resume Next",
         'Set fso = CreateObject("Scripting.FileSystemObject")',
         'Set logFile = fso.CreateTextFile(fso.GetParentFolderName(WScript.ScriptFullName) & "\\CADView-builder-log.txt", True)',
@@ -1273,7 +1264,8 @@ def write_solidworks_builder_script(
         closed: bool = True,
     ) -> int:
         plane_name = str(sketch.get("plane", "Front Plane")).replace('"', '""')
-        outer_points = list(sketch["outer_loop"]["points"])
+        outer_loop = dict(sketch["outer_loop"])
+        outer_points = list(outer_loop.get("points", []))
         sketch_name = str(sketch.get("name", label)).replace('"', '""')
         safe_label = label.replace('"', '""')
         lines.extend(
@@ -1316,9 +1308,29 @@ def write_solidworks_builder_script(
                 "sketchManager.DisplayWhenAdded = False",
                 "segmentIndex = 0",
                 "createdCount = 0",
+                "Set axisSegment = Nothing",
             ]
         )
-        if sketch.get("curve") == "spline":
+        if outer_loop.get("kind") == "circle":
+            x, y = outer_loop["center"]
+            radius = float(outer_loop["radius"]) * scale
+            lines.extend(
+                [
+                    (
+                        "Set segment = sketchManager.CreateCircleByRadius("
+                        f"{format(float(x) * scale, '.17g')}, "
+                        f"{format(float(y) * scale, '.17g')}, 0, "
+                        f"{format(radius, '.17g')})"
+                    ),
+                    (
+                        "If segment Is Nothing Then "
+                        f'Err.Raise vbObjectError + 19, , "Could not create {safe_label} circle."'
+                    ),
+                    "createdCount = createdCount + 1",
+                    f'logFile.WriteLine "{safe_label}_outer_circle=created"',
+                ]
+            )
+        elif sketch.get("curve") == "spline":
             coordinates: list[str] = []
             for point in outer_points:
                 coordinates.extend(
@@ -1368,6 +1380,30 @@ def write_solidworks_builder_script(
                     list(inner["points"]),
                     f"{safe_label}_inner_{inner_index}",
                 )
+        centerline = sketch.get("centerline")
+        if centerline is not None:
+            (start_x, start_y), (end_x, end_y) = centerline
+            axis_arguments = ", ".join(
+                format(value * scale, ".17g")
+                for value in (
+                    float(start_x),
+                    float(start_y),
+                    0.0,
+                    float(end_x),
+                    float(end_y),
+                    0.0,
+                )
+            )
+            lines.extend(
+                [
+                    f"Set axisSegment = sketchManager.CreateCenterLine({axis_arguments})",
+                    (
+                        "If axisSegment Is Nothing Then Err.Raise vbObjectError + 15, , "
+                        f'"Could not create the {safe_label} revolve centerline."'
+                    ),
+                    f'logFile.WriteLine "{safe_label}_centerline=created"',
+                ]
+            )
         lines.extend(
             [
                 'logFile.WriteLine "segments_attempted=" & segmentIndex',
@@ -1394,6 +1430,8 @@ def write_solidworks_builder_script(
                 f'logFile.WriteLine "sketch_ok={safe_label}"',
             ]
         )
+        if outer_loop.get("kind") == "circle":
+            return 1
         return max(3 if closed else 2, len(outer_points) // 2)
 
     for feature_index, feature in enumerate(features, start=1):
@@ -1410,13 +1448,15 @@ def write_solidworks_builder_script(
 
         if feature_type == "sweep_cut":
             path = dict(feature["path"])
+            path_points = list(path["points"])
+            # SolidWorks often rejects dense closed splines from recovered mesh
+            # paths; line segments follow the same geometry and sweep reliably.
             path_sketch = {
                 "name": path["name"],
                 "plane": path.get("plane", "Front Plane"),
-                "curve": "spline",
                 "outer_loop": {
                     "kind": "polyline",
-                    "points": path["points"],
+                    "points": path_points,
                 },
                 "inner_loops": [],
             }
@@ -1459,15 +1499,139 @@ def write_solidworks_builder_script(
                         "0, 0, 0, 0, True, True, 0, True, False, "
                         "True, False, False, 0, 0)"
                     ),
+                ]
+            )
+            fallback = feature.get("fallback")
+            if isinstance(fallback, dict):
+                fallback_sketch = dict(fallback["sketch"])
+                fallback_name = str(
+                    fallback.get("name", "CADView Sweep Fallback Cut")
+                ).replace('"', '""')
+                fallback_depth = format(
+                    float(fallback["depth"]) * scale, ".17g"
+                )
+                fallback_start_value = float(
+                    fallback.get("start_offset", 0.0)
+                )
+                fallback_start = format(
+                    fallback_start_value * scale, ".17g"
+                )
+                fallback_start_condition = (
+                    3 if abs(fallback_start_value) > 1e-12 else 0
+                )
+                fallback_end_condition = (
+                    6 if fallback.get("end_condition") == "midplane" else 0
+                )
+                lines.extend(
+                    [
+                        "fallbackUsed = False",
+                        "If feature Is Nothing Then",
+                        "fallbackUsed = True",
+                        (
+                            f'logFile.WriteLine "feature_fallback='
+                            f'{feature_index}:sweep_cut_to_cut"'
+                        ),
+                    ]
+                )
+                emit_sketch(
+                    fallback_sketch,
+                    label=f"feature_{feature_index}_fallback_profile",
+                    closed=True,
+                )
+                lines.extend(
+                    [
+                        (
+                            "Set feature = model.FeatureManager.FeatureCut3("
+                            "True, False, False, "
+                            f"{fallback_end_condition}, 0, {fallback_depth}, 0, "
+                            "False, False, False, False, 0, 0, False, False, "
+                            "False, False, False, True, True, True, True, False, "
+                            f"{fallback_start_condition}, {fallback_start}, False)"
+                        ),
+                        (
+                            "If feature Is Nothing Then "
+                            "Err.Raise vbObjectError + 13, , "
+                            '"SolidWorks rejected both the recovered Sweep-Cut '
+                            'and its native Cut-Extrude fallback."'
+                        ),
+                        f'feature.Name = "{fallback_name}"',
+                        f'logFile.WriteLine "feature_ok={feature_index}:cut_fallback"',
+                        "End If",
+                        "If Not fallbackUsed Then",
+                        f'feature.Name = "{feature_name}"',
+                        f'logFile.WriteLine "feature_ok={feature_index}:sweep_cut"',
+                        "End If",
+                        "model.EditRebuild3",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "If feature Is Nothing Then",
+                        (
+                            "  Err.Raise vbObjectError + 13, , "
+                            '"SolidWorks rejected the recovered Sweep-Cut."'
+                        ),
+                        "End If",
+                        f'feature.Name = "{feature_name}"',
+                        "model.EditRebuild3",
+                        f'logFile.WriteLine "feature_ok={feature_index}:sweep_cut"',
+                    ]
+                )
+            continue
+
+        if feature_type in {"revolve", "revolve_cut"}:
+            sketch = dict(feature["sketch"])
+            emit_sketch(
+                sketch, label=f"feature_{feature_index}_profile", closed=True
+            )
+            sketch_name = str(sketch["name"]).replace('"', '""')
+            angle = format(
+                np.radians(float(feature.get("angle_degrees", 360.0))), ".17g"
+            )
+            is_cut = "True" if feature_type == "revolve_cut" else "False"
+            operation_label = (
+                "Revolve-Cut" if feature_type == "revolve_cut" else "Revolve"
+            )
+            lines.extend(
+                [
+                    "model.ClearSelection2 True",
+                    (
+                        "selected = model.Extension.SelectByID2("
+                        f'"{sketch_name}", "SKETCH", 0, 0, 0, '
+                        "False, 0, Nothing, 0)"
+                    ),
+                    (
+                        "If Not selected Then Err.Raise vbObjectError + 16, , "
+                        '"Could not select the revolve profile sketch."'
+                    ),
+                    (
+                        "If axisSegment Is Nothing Then Err.Raise vbObjectError + 17, , "
+                        '"The revolve sketch has no centerline to revolve about."'
+                    ),
+                    "Set selectionData = model.SelectionManager.CreateSelectData",
+                    # Mark 4 is how SolidWorks distinguishes the axis of
+                    # revolution from the profile in the same selection list.
+                    "selectionData.Mark = 4",
+                    "axisSegment.Select4 True, selectionData",
+                    (
+                        "Set feature = model.FeatureManager.FeatureRevolve2("
+                        f"True, True, False, {is_cut}, False, False, 0, 0, "
+                        f"{angle}, 0, False, False, 0, 0, 0, 0, 0, "
+                        "True, True, True)"
+                    ),
                     "If feature Is Nothing Then",
                     (
-                        "  Err.Raise vbObjectError + 13, , "
-                        '"SolidWorks rejected the recovered Sweep-Cut."'
+                        "  Err.Raise vbObjectError + 18, , "
+                        f'"SolidWorks rejected the recovered {operation_label}."'
                     ),
                     "End If",
                     f'feature.Name = "{feature_name}"',
                     "model.EditRebuild3",
-                    f'logFile.WriteLine "feature_ok={feature_index}:sweep_cut"',
+                    (
+                        f'logFile.WriteLine "feature_ok={feature_index}:'
+                        f'{feature_type}"'
+                    ),
                 ]
             )
             continue
@@ -1477,16 +1641,27 @@ def write_solidworks_builder_script(
             sketch, label=f"feature_{feature_index}_profile", closed=True
         )
         depth = format(float(feature["depth"]) * scale, ".17g")
-        start_offset_value = float(feature.get("start_offset", 0.0))
+        start_offset_value = float(
+            feature.get(
+                "solidworks_start_offset",
+                feature.get("start_offset", 0.0),
+            )
+        )
         start_offset = format(start_offset_value * scale, ".17g")
         start_condition = 3 if abs(start_offset_value) > 1e-12 else 0
+        flip_start_offset = (
+            "True" if feature.get("flip_start_offset") else "False"
+        )
         if feature_type == "cut":
+            end_condition = (
+                6 if feature.get("end_condition") == "midplane" else 0
+            )
             create_feature = (
                 "Set feature = model.FeatureManager.FeatureCut3("
-                f"True, False, False, 0, 0, {depth}, 0, "
+                f"True, False, False, {end_condition}, 0, {depth}, 0, "
                 "False, False, False, False, 0, 0, False, False, "
                 "False, False, False, True, True, True, True, False, "
-                f"{start_condition}, {start_offset}, False)"
+                f"{start_condition}, {start_offset}, {flip_start_offset})"
             )
         else:
             end_condition = 6 if feature.get("end_condition") == "midplane" else 0
@@ -1495,7 +1670,7 @@ def write_solidworks_builder_script(
                 f"True, False, False, {end_condition}, 0, {depth}, 0, "
                 "False, False, False, True, 0, 0, False, False, "
                 "False, False, True, False, True, "
-                f"{start_condition}, {start_offset}, False)"
+                f"{start_condition}, {start_offset}, {flip_start_offset})"
             )
         lines.extend(
             [

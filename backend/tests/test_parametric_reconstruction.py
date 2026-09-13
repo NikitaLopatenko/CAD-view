@@ -110,7 +110,13 @@ def test_solidworks_builder_writes_all_groove_features(tmp_path) -> None:
     script = script_path.read_text(encoding="ascii")
     assert script.count("FeatureExtrusion3") == 1
     assert script.count("InsertCutSwept5") == 1
+    assert script.count("FeatureCut3") == 1
     assert "CADView Perimeter Sweep Cut" in script
+    assert "feature_fallback=2:sweep_cut_to_cut" in script
+    assert "feature_ok=2:cut_fallback" in script
+    assert "rejected both the recovered Sweep-Cut" in script
+    assert "feature_2_path_outer" in script
+    assert "CreateSpline2" not in script
     assert 'False, 1, Nothing, 0)' in script
     assert 'True, 4, Nothing, 0)' in script
     assert "CADView-editable-" in script
@@ -212,6 +218,55 @@ def test_parametric_api_and_mocked_solidworks_export(
             export_dir / "solidworks" / f"{exported['id']}.json"
         ).read_text(encoding="utf-8")
         assert json.loads(metadata)["source_mesh_id"] == declared["id"]
+
+
+def test_solidworks_export_blocks_unsupported_low_agreement_recipe(
+    monkeypatch, tmp_path
+) -> None:
+    upload_dir = tmp_path / "uploads"
+    export_dir = tmp_path / "exports"
+    upload_dir.mkdir()
+    export_dir.mkdir()
+    monkeypatch.setattr(main, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(main, "EXPORT_DIR", export_dir)
+
+    low_quality_recipe = {
+        "schema_version": "3.0",
+        "strategy": "revolve_reconstruction",
+        "unit": "mm",
+        "confidence": 0.24,
+        "features": [],
+        "diagnostics": {
+            "quality": {
+                "status": "unsupported",
+                "agreement": 0.24,
+                "minimum_export_agreement": 0.60,
+                "export_recommended": False,
+            }
+        },
+        "warnings": [],
+    }
+    monkeypatch.setattr(
+        main, "build_recipe", lambda mesh, unit: low_quality_recipe
+    )
+
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/meshes",
+            files={"file": ("thin-box.stl", _thin_box_stl(), "model/stl")},
+        ).json()
+        declared = client.post(
+            f"/api/meshes/{uploaded['id']}/units",
+            json={"unit": "mm"},
+        ).json()
+        response = client.post(
+            f"/api/meshes/{declared['id']}/solidworks",
+            json={"visible": False},
+        )
+
+    assert response.status_code == 422
+    assert "agreement 0.240" in response.json()["detail"]
+    assert not (export_dir / "solidworks").exists()
 
 
 def test_solidworks_api_falls_back_to_interactive_builder(

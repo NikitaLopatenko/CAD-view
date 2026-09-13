@@ -26,6 +26,7 @@ def test_capabilities_report_dual_engines(monkeypatch) -> None:
     assert payload["neural_available"] is True
     assert "auto" in payload["engines"]
     assert "vggt" in payload["engines"]
+    assert "triposr" in payload["engines"]
 
 
 def test_photo_reconstruction_accepts_engine_choice(monkeypatch, tmp_path) -> None:
@@ -45,6 +46,25 @@ def test_photo_reconstruction_accepts_engine_choice(monkeypatch, tmp_path) -> No
 
     assert response.status_code == 202
     assert response.json()["engine"] == "vggt"
+
+
+def test_photo_reconstruction_accepts_triposr_scaffold(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(main, "RECONSTRUCTION_DIR", tmp_path)
+    monkeypatch.setattr(main, "_run_reconstruction_job", lambda _: None)
+    photos = [
+        ("files", (f"photo-{index}.jpg", b"jpeg-data", "image/jpeg"))
+        for index in range(6)
+    ]
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/reconstructions/photos",
+            files=photos,
+            data={"engine": "triposr"},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["engine"] == "triposr"
 
 
 def test_mesh_looks_weak_detects_two_large_components(tmp_path) -> None:
@@ -187,3 +207,6 @@ def test_tsdf_fusion_reconstructs_one_sphere_surface() -> None:
     assert len(mesh.split(only_watertight=False)) == 1
     assert diagnostics["method"] == "confidence_masked_tsdf"
     assert diagnostics["components_after_cleanup"] == 1
+    assert diagnostics["boundary_edges_after_cleanup"] == 0
+    assert diagnostics["volume_guard_voxels"] == 2
+    assert mesh.is_watertight

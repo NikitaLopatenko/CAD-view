@@ -54,12 +54,14 @@ internal static class Program
         if (
             recipe.Features.Count == 0
             || recipe.Features.Any(
-                feature => feature.Type is not ("extrude" or "cut" or "sweep_cut")
+                feature => feature.Type is not (
+                    "extrude" or "cut" or "sweep_cut" or "revolve" or "revolve_cut"
+                )
             )
         )
         {
             throw new InvalidOperationException(
-                "The bridge requires native extrude/cut/sweep features."
+                "The bridge requires native extrude/cut/sweep/revolve/revolve-cut features."
             );
         }
 
@@ -131,21 +133,22 @@ internal static class Program
                                 null,
                                 null
                             ),
-                            []
+                            [],
+                            null
                         ),
                         scale,
                         closed: sourceFeature.Path.Closed
                     );
-                    pathSketch.Name = sourceFeature.Path.Name;
+                    pathSketch.Feature.Name = sourceFeature.Path.Name;
                     var profileSketch = CreateSketch(
                         model,
                         sourceFeature.Profile,
                         scale
                     );
-                    profileSketch.Name = sourceFeature.Profile.Name;
+                    profileSketch.Feature.Name = sourceFeature.Profile.Name;
                     model.ClearSelection2(true);
-                    var profileSelected = profileSketch.Select2(false, 1);
-                    var pathSelected = pathSketch.Select2(true, 4);
+                    var profileSelected = profileSketch.Feature.Select2(false, 1);
+                    var pathSelected = pathSketch.Feature.Select2(true, 4);
                     if (!profileSelected || !pathSelected)
                     {
                         throw new InvalidOperationException(
@@ -178,11 +181,67 @@ internal static class Program
                     );
                     if (sweep is null)
                     {
-                        throw new InvalidOperationException(
-                            "SolidWorks rejected the recovered Sweep-Cut."
+                        var fallback = sourceFeature.Fallback
+                            ?? throw new InvalidOperationException(
+                                "SolidWorks rejected the recovered Sweep-Cut "
+                                    + "and no fallback feature was provided."
+                            );
+                        var fallbackSketchRecipe = fallback.Sketch
+                            ?? throw new InvalidOperationException(
+                                "Sweep fallback is missing its cut sketch."
+                            );
+                        model.ClearSelection2(true);
+                        var fallbackSketch = CreateSketch(
+                            model,
+                            fallbackSketchRecipe,
+                            scale
                         );
+                        var fallbackStartCondition =
+                            Math.Abs(fallback.StartOffset) > 1e-12 ? 3 : 0;
+                        var fallbackEndCondition =
+                            fallback.EndCondition == "midplane" ? 6 : 0;
+                        sweep = model.FeatureManager.FeatureCut3(
+                            true,
+                            false,
+                            false,
+                            fallbackEndCondition,
+                            0,
+                            fallback.Depth * scale,
+                            0,
+                            false,
+                            false,
+                            false,
+                            false,
+                            0,
+                            0,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            true,
+                            true,
+                            true,
+                            true,
+                            false,
+                            fallbackStartCondition,
+                            fallback.StartOffset * scale,
+                            false
+                        );
+                        if (sweep is null)
+                        {
+                            throw new InvalidOperationException(
+                                "SolidWorks rejected both the recovered Sweep-Cut "
+                                    + "and its native Cut-Extrude fallback."
+                            );
+                        }
+                        fallbackSketch.Feature.Name = fallbackSketchRecipe.Name;
+                        sweep.Name = fallback.Name;
                     }
-                    sweep.Name = sourceFeature.Name;
+                    else
+                    {
+                        sweep.Name = sourceFeature.Name;
+                    }
                     model.EditRebuild3();
                     continue;
                 }
@@ -192,15 +251,79 @@ internal static class Program
                         $"{sourceFeature.Name} is missing its sketch."
                     );
                 var sketchFeature = CreateSketch(model, sketchRecipe, scale);
-                var startCondition = Math.Abs(sourceFeature.StartOffset) > 1e-12
+                if (sourceFeature.Type is "revolve" or "revolve_cut")
+                {
+                    if (sketchFeature.Centerline is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"{sourceFeature.Name} has no revolve centerline."
+                        );
+                    }
+                    model.ClearSelection2(true);
+                    var profileSelected = sketchFeature.Feature.Select2(false, 0);
+                    var selectionManager = (SelectionMgr)model.SelectionManager;
+                    var selectionData = selectionManager.CreateSelectData();
+                    selectionData.Mark = 4;
+                    var axisSelected = sketchFeature.Centerline.Select4(
+                        true, selectionData
+                    );
+                    if (!profileSelected || !axisSelected)
+                    {
+                        throw new InvalidOperationException(
+                            "SolidWorks could not select the revolve profile/axis."
+                        );
+                    }
+                    var revolve = model.FeatureManager.FeatureRevolve2(
+                        true,
+                        true,
+                        false,
+                        sourceFeature.Type == "revolve_cut",
+                        false,
+                        false,
+                        0,
+                        0,
+                        sourceFeature.AngleDegrees * Math.PI / 180.0,
+                        0,
+                        false,
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        true,
+                        true,
+                        true
+                    );
+                    if (revolve is null)
+                    {
+                        throw new InvalidOperationException(
+                            "SolidWorks rejected the recovered "
+                                + (
+                                    sourceFeature.Type == "revolve_cut"
+                                        ? "Revolve-Cut."
+                                        : "Revolve."
+                                )
+                        );
+                    }
+                    sketchFeature.Feature.Name = sketchRecipe.Name;
+                    revolve.Name = sourceFeature.Name;
+                    model.EditRebuild3();
+                    continue;
+                }
+                var solidWorksStartOffset =
+                    sourceFeature.SolidWorksStartOffset ?? sourceFeature.StartOffset;
+                var startCondition = Math.Abs(solidWorksStartOffset) > 1e-12
                     ? 3
                     : 0;
+                var endCondition =
+                    sourceFeature.EndCondition == "midplane" ? 6 : 0;
                 Feature? feature = sourceFeature.Type == "cut"
                     ? model.FeatureManager.FeatureCut3(
                         true,
                         false,
                         false,
-                        0,
+                        endCondition,
                         0,
                         sourceFeature.Depth * scale,
                         0,
@@ -221,14 +344,14 @@ internal static class Program
                         true,
                         false,
                         startCondition,
-                        sourceFeature.StartOffset * scale,
-                        false
+                        solidWorksStartOffset * scale,
+                        sourceFeature.FlipStartOffset
                     )
                     : model.FeatureManager.FeatureExtrusion3(
                         true,
                         false,
                         false,
-                        sourceFeature.EndCondition == "midplane" ? 6 : 0,
+                        endCondition,
                         0,
                         sourceFeature.Depth * scale,
                         0,
@@ -246,19 +369,19 @@ internal static class Program
                         false,
                         true,
                         startCondition,
-                        sourceFeature.StartOffset * scale,
-                        false
+                        solidWorksStartOffset * scale,
+                        sourceFeature.FlipStartOffset
                     );
                 if (feature is null)
                 {
-                    var sketch = (Sketch)sketchFeature.GetSpecificFeature2();
+                    var sketch = (Sketch)sketchFeature.Feature.GetSpecificFeature2();
                     var segments = (object[]?)sketch.GetSketchSegments();
                     throw new InvalidOperationException(
                         $"SolidWorks rejected '{sourceFeature.Name}' "
                             + $"({segments?.Length ?? 0} sketch segments were created)."
                     );
                 }
-                sketchFeature.Name = sketchRecipe.Name;
+                sketchFeature.Feature.Name = sketchRecipe.Name;
                 feature.Name = sourceFeature.Name;
                 model.EditRebuild3();
             }
@@ -327,7 +450,7 @@ internal static class Program
         }
     }
 
-    private static Feature CreateSketch(
+    private static CreatedSketch CreateSketch(
         ModelDoc2 model,
         SketchRecipe sketch,
         double scale,
@@ -403,13 +526,41 @@ internal static class Program
         manager.DisplayWhenAdded = false;
         model.ViewZoomtofit2();
 
-        CreateSpline(
-            manager,
-            sketch.OuterLoop.Points
-                ?? throw new InvalidOperationException("Outer loop has no points."),
-            scale,
-            closed
-        );
+        if (sketch.OuterLoop.Kind == "circle")
+        {
+            if (
+                sketch.OuterLoop.Center is null
+                || sketch.OuterLoop.Center.Length != 2
+                || sketch.OuterLoop.Radius is null
+            )
+            {
+                throw new InvalidOperationException(
+                    "Outer circle loop is incomplete."
+                );
+            }
+            var outerCircle = manager.CreateCircleByRadius(
+                sketch.OuterLoop.Center[0] * scale,
+                sketch.OuterLoop.Center[1] * scale,
+                0,
+                sketch.OuterLoop.Radius.Value * scale
+            );
+            if (outerCircle is null)
+            {
+                throw new InvalidOperationException(
+                    "SolidWorks could not create the outer profile circle."
+                );
+            }
+        }
+        else
+        {
+            CreatePolyline(
+                manager,
+                sketch.OuterLoop.Points
+                    ?? throw new InvalidOperationException("Outer loop has no points."),
+                scale,
+                closed
+            );
+        }
         foreach (var loop in sketch.InnerLoops)
         {
             if (loop.Kind == "circle")
@@ -433,12 +584,39 @@ internal static class Program
             }
             else
             {
-                CreateSpline(
+                CreatePolyline(
                     manager,
                     loop.Points
                         ?? throw new InvalidOperationException("Polyline loop has no points."),
                     scale,
                     true
+                );
+            }
+        }
+        SketchSegment? centerline = null;
+        if (sketch.Centerline is not null)
+        {
+            if (
+                sketch.Centerline.Length != 2
+                || sketch.Centerline.Any(point => point.Length != 2)
+            )
+            {
+                throw new InvalidOperationException(
+                    "Revolve centerline must contain two 2D points."
+                );
+            }
+            centerline = manager.CreateCenterLine(
+                sketch.Centerline[0][0] * scale,
+                sketch.Centerline[0][1] * scale,
+                0,
+                sketch.Centerline[1][0] * scale,
+                sketch.Centerline[1][1] * scale,
+                0
+            );
+            if (centerline is null)
+            {
+                throw new InvalidOperationException(
+                    "SolidWorks could not create the revolve centerline."
                 );
             }
         }
@@ -458,10 +636,10 @@ internal static class Program
         {
             throw new InvalidOperationException("Recovered sketch was not created.");
         }
-        return sketchFeature;
+        return new CreatedSketch(sketchFeature, centerline);
     }
 
-    private static void CreateSpline(
+    private static void CreatePolyline(
         SketchManager manager,
         IReadOnlyList<double[]> points,
         double scale,
@@ -476,22 +654,25 @@ internal static class Program
             );
         }
 
-        var pointCount = points.Count + (closed ? 1 : 0);
-        var coordinates = new double[pointCount * 3];
-        for (var index = 0; index < pointCount; index++)
+        var segmentCount = closed ? points.Count : points.Count - 1;
+        for (var index = 0; index < segmentCount; index++)
         {
-            var point = points[index % points.Count];
-            coordinates[index * 3] = point[0] * scale;
-            coordinates[index * 3 + 1] = point[1] * scale;
-            coordinates[index * 3 + 2] = 0;
-        }
-
-        var segment = manager.CreateSpline2(coordinates, true);
-        if (segment is null)
-        {
-            throw new InvalidOperationException(
-                "SolidWorks could not create the recovered sketch spline."
+            var start = points[index];
+            var end = points[(index + 1) % points.Count];
+            var segment = manager.CreateLine(
+                start[0] * scale,
+                start[1] * scale,
+                0,
+                end[0] * scale,
+                end[1] * scale,
+                0
             );
+            if (segment is null)
+            {
+                throw new InvalidOperationException(
+                    $"SolidWorks could not create recovered polyline segment {index + 1}."
+                );
+            }
         }
     }
 }
@@ -506,10 +687,14 @@ internal sealed record FeatureRecipe(
     [property: JsonPropertyName("type")] string Type,
     [property: JsonPropertyName("depth")] double Depth,
     [property: JsonPropertyName("start_offset")] double StartOffset,
+    [property: JsonPropertyName("solidworks_start_offset")] double? SolidWorksStartOffset,
+    [property: JsonPropertyName("flip_start_offset")] bool FlipStartOffset,
     [property: JsonPropertyName("end_condition")] string? EndCondition,
+    [property: JsonPropertyName("angle_degrees")] double AngleDegrees,
     [property: JsonPropertyName("sketch")] SketchRecipe? Sketch,
     [property: JsonPropertyName("profile")] SketchRecipe? Profile,
-    [property: JsonPropertyName("path")] PathRecipe? Path
+    [property: JsonPropertyName("path")] PathRecipe? Path,
+    [property: JsonPropertyName("fallback")] FeatureRecipe? Fallback
 );
 
 internal sealed record PathRecipe(
@@ -523,7 +708,8 @@ internal sealed record SketchRecipe(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("plane")] string Plane,
     [property: JsonPropertyName("outer_loop")] LoopRecipe OuterLoop,
-    [property: JsonPropertyName("inner_loops")] List<LoopRecipe> InnerLoops
+    [property: JsonPropertyName("inner_loops")] List<LoopRecipe> InnerLoops,
+    [property: JsonPropertyName("centerline")] double[][]? Centerline
 );
 
 internal sealed record LoopRecipe(
@@ -531,4 +717,9 @@ internal sealed record LoopRecipe(
     [property: JsonPropertyName("points")] double[][]? Points,
     [property: JsonPropertyName("center")] double[]? Center,
     [property: JsonPropertyName("radius")] double? Radius
+);
+
+internal sealed record CreatedSketch(
+    Feature Feature,
+    SketchSegment? Centerline
 );

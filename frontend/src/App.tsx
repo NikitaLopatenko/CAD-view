@@ -41,6 +41,11 @@ function App() {
   const [declaringUnits, setDeclaringUnits] = useState(false)
   const [repairing, setRepairing] = useState(false)
   const [fillSmallHoles, setFillSmallHoles] = useState(false)
+  const [repairMode, setRepairMode] = useState<
+    'conservative' | 'watertight_proxy'
+  >('conservative')
+  const [wrapResolution, setWrapResolution] = useState(160)
+  const [closingRadius, setClosingRadius] = useState(2)
   const [error, setError] = useState<string | null>(null)
   const [selectedPoints, setSelectedPoints] = useState<Vec3[]>([])
   const [selectionEnabled, setSelectionEnabled] = useState(false)
@@ -461,7 +466,13 @@ function App() {
     setRepairing(true)
     setError(null)
     try {
-      const repaired = await repairMesh(record.id, fillSmallHoles)
+      const repaired = await repairMesh(record.id, {
+        fill_small_holes: fillSmallHoles,
+        mode: repairMode,
+        voxel_resolution: wrapResolution,
+        closing_radius_voxels: closingRadius,
+        smoothing_iterations: 6,
+      })
       setRecord(repaired)
       resetScaleInput()
     } catch (repairError) {
@@ -738,6 +749,12 @@ function App() {
                     VGGT neural (low-texture / black objects)
                   </option>
                   <option
+                    value="triposr"
+                    disabled={capabilities?.generative_available === false}
+                  >
+                    TripoSR scaffold (complete shape, inferred geometry)
+                  </option>
+                  <option
                     value="meshroom"
                     disabled={
                       !(
@@ -824,6 +841,14 @@ function App() {
                   <> · using {reconstructionJob.resolved_engine}</>
                 )}
               </small>
+              {reconstructionEngine === 'triposr' && (
+                <p className="review-warning">
+                  TripoSR uses the best masked photo to generate a plausible
+                  complete object. Hidden surfaces and dimensions are inferred,
+                  not measured. Use it as a scaffold and validate every CAD
+                  dimension independently.
+                </p>
+              )}
               {error && <p className="upload-error">{error}</p>}
             </div>
           )}
@@ -1088,27 +1113,98 @@ function App() {
             {record ? (
               <div className="scale-controls">
                 <p className="muted">
-                  Duplicate-face cleanup and winding correction do not smooth or
-                  reshape observed surfaces.
+                  The observed scan stays immutable. Choose topology-only cleanup
+                  or create a separate inferred watertight proxy.
                 </p>
                 <label className="repair-option">
                   <input
-                    type="checkbox"
-                    checked={fillSmallHoles}
-                    onChange={(event) => setFillSmallHoles(event.target.checked)}
+                    type="radio"
+                    name="repair-mode"
+                    checked={repairMode === 'conservative'}
+                    onChange={() => setRepairMode('conservative')}
                   />
                   <span>
-                    Fill triangular or quad holes
-                    <small>Added faces require human review.</small>
+                    Conservative topology cleanup
+                    <small>Fix winding and duplicates without moving vertices.</small>
                   </span>
                 </label>
+                <label className="repair-option">
+                  <input
+                    type="radio"
+                    name="repair-mode"
+                    checked={repairMode === 'watertight_proxy'}
+                    onChange={() => setRepairMode('watertight_proxy')}
+                  />
+                  <span>
+                    Watertight scan proxy
+                    <small>
+                      Voxel-wrap, close narrow defects, and smooth for printing or
+                      CAD analysis. This infers geometry.
+                    </small>
+                  </span>
+                </label>
+                {repairMode === 'conservative' ? (
+                  <label className="repair-option">
+                    <input
+                      type="checkbox"
+                      checked={fillSmallHoles}
+                      onChange={(event) => setFillSmallHoles(event.target.checked)}
+                    />
+                    <span>
+                      Fill simple boundary loops
+                      <small>
+                        Handles openings larger than triangles/quads; review every
+                        inferred patch.
+                      </small>
+                    </span>
+                  </label>
+                ) : (
+                  <div className="repair-settings">
+                    <label>
+                      <span>Wrap resolution</span>
+                      <input
+                        type="range"
+                        min="96"
+                        max="256"
+                        step="16"
+                        value={wrapResolution}
+                        onChange={(event) =>
+                          setWrapResolution(Number(event.target.value))
+                        }
+                      />
+                      <strong>{wrapResolution}</strong>
+                    </label>
+                    <label>
+                      <span>Defect closing</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="5"
+                        step="1"
+                        value={closingRadius}
+                        onChange={(event) =>
+                          setClosingRadius(Number(event.target.value))
+                        }
+                      />
+                      <strong>{closingRadius} vox</strong>
+                    </label>
+                    <p className="review-warning">
+                      Stronger closing removes more dents and tunnels, but can erase
+                      intentional slots or holes.
+                    </p>
+                  </div>
+                )}
                 <button
                   type="button"
                   className="control-button"
                   onClick={applyRepair}
                   disabled={repairing}
                 >
-                  {repairing ? 'Creating repair derivative…' : 'Repair topology'}
+                  {repairing
+                    ? 'Creating derived mesh…'
+                    : repairMode === 'watertight_proxy'
+                      ? 'Create watertight proxy'
+                      : 'Repair topology'}
                 </button>
 
                 {record.repair_report && (
@@ -1134,13 +1230,34 @@ function App() {
                       <strong>{record.repair_report.faces_added}</strong>
                     </div>
                     <div>
-                      <span>Existing vertex displacement</span>
+                      <span>Boundary loops filled</span>
+                      <strong>
+                        {record.repair_report.boundary_loops_filled}
+                      </strong>
+                    </div>
+                    <div>
+                      <span>
+                        {record.repair_report.method === 'voxel_wrap'
+                          ? 'Maximum proxy deviation'
+                          : 'Existing vertex displacement'}
+                      </span>
                       <strong>
                         {formatNumber(
                           record.repair_report.max_existing_vertex_displacement,
                         )}
                       </strong>
                     </div>
+                    {record.repair_report.normalized_rms_percent !== null && (
+                      <div>
+                        <span>Symmetric RMS deviation</span>
+                        <strong>
+                          {formatNumber(
+                            record.repair_report.normalized_rms_percent,
+                          )}
+                          %
+                        </strong>
+                      </div>
+                    )}
                     {record.repair_report.requires_human_review && (
                       <p className="review-warning">
                         Review required: new closure faces were inferred.
@@ -1296,46 +1413,101 @@ function App() {
                       <span>
                         <strong>
                           {parametricRecipe.strategy ===
-                          'sweep_cut_reconstruction'
+                          'residual_refined_reconstruction'
+                            ? 'Residual-refined feature tree recovered'
+                            : parametricRecipe.strategy ===
+                              'revolve_reconstruction'
+                            ? 'Native revolve recovered'
+                            : parametricRecipe.strategy ===
+                              'sweep_cut_reconstruction'
                             ? 'Native swept groove selected'
                             : parametricRecipe.diagnostics.groove_detected
                             ? 'Perimeter groove recovered'
                             : 'Prismatic base recovered'}
                         </strong>
                         <small>
-                          Confidence{' '}
+                          {parametricRecipe.diagnostics.agreement?.method ===
+                          'volume_iou'
+                            ? 'Volume IoU '
+                            : 'Confidence '}
                           {formatNumber(parametricRecipe.confidence * 100)}% ·{' '}
                           {parametricRecipe.features.length} native feature
                           {parametricRecipe.features.length === 1 ? '' : 's'}
                         </small>
+                        {parametricRecipe.diagnostics.quality && (
+                          <small>
+                            Reconstruction quality:{' '}
+                            {parametricRecipe.diagnostics.quality.status} ·
+                            export{' '}
+                            {parametricRecipe.diagnostics.quality
+                              .export_recommended
+                              ? 'enabled'
+                              : 'blocked'}
+                          </small>
+                        )}
                         {parametricRecipe.features.map((feature) => (
                           <small key={feature.id}>
                             {feature.name} ·{' '}
-                            {feature.type === 'sweep_cut'
-                              ? 'profile depth'
-                              : 'depth'}{' '}
-                            {formatNumber(feature.depth)}{' '}
-                            {parametricRecipe.unit}
-                            {feature.start_offset > 0
+                            {feature.type === 'revolve' ||
+                            feature.type === 'revolve_cut'
+                              ? `${formatNumber(
+                                  feature.angle_degrees ?? 360,
+                                )}° ${
+                                  feature.type === 'revolve_cut'
+                                    ? 'cut'
+                                    : 'boss'
+                                } about a sketch centerline`
+                              : `${
+                                  feature.type === 'sweep_cut'
+                                    ? 'profile depth'
+                                    : 'depth'
+                                } ${formatNumber(feature.depth ?? 0)} ${
+                                  parametricRecipe.unit
+                                }`}
+                            {feature.start_offset && feature.start_offset > 0
                               ? ` · starts at ${formatNumber(feature.start_offset)} ${parametricRecipe.unit}`
                               : ''}
                           </small>
                         ))}
+                        {parametricRecipe.diagnostics.revolve_axis_index !=
+                          null && (
+                          <small>
+                            Profile{' '}
+                            {parametricRecipe.diagnostics.profile_point_count ??
+                              0}{' '}
+                            points · max radius{' '}
+                            {formatNumber(
+                              parametricRecipe.diagnostics.maximum_radius ?? 0,
+                            )}{' '}
+                            {parametricRecipe.unit}
+                            {parametricRecipe.diagnostics.bore_radius
+                              ? ` · bore radius ${formatNumber(
+                                  parametricRecipe.diagnostics.bore_radius,
+                                )} ${parametricRecipe.unit}`
+                              : ''}{' '}
+                            · out-of-round{' '}
+                            {formatNumber(
+                              (parametricRecipe.diagnostics.roundness_error ??
+                                0) * 100,
+                            )}
+                            %
+                          </small>
+                        )}
                         {parametricRecipe.diagnostics.groove_detected && (
                           <small>
                             Groove width{' '}
                             {formatNumber(
-                              parametricRecipe.diagnostics.groove_width,
+                              parametricRecipe.diagnostics.groove_width ?? 0,
                             )}{' '}
                             {parametricRecipe.unit} · side flange{' '}
                             {formatNumber(
-                              parametricRecipe.diagnostics.flange_depth,
+                              parametricRecipe.diagnostics.flange_depth ?? 0,
                             )}{' '}
                             {parametricRecipe.unit}
                           </small>
                         )}
                         {parametricRecipe.diagnostics.feature_intent
-                          .orthogonal_section_analysis && (
+                          ?.orthogonal_section_analysis && (
                           <small>
                             Intent test:{' '}
                             {parametricRecipe.diagnostics.feature_intent
@@ -1372,7 +1544,96 @@ function App() {
                             %
                           </small>
                         )}
-                        {parametricRecipe.diagnostics.deviation.rms !== null && (
+                        {parametricRecipe.diagnostics.residual_refinement
+                          ?.attempted && (
+                          <small>
+                            Residual loop:{' '}
+                            {
+                              parametricRecipe.diagnostics.residual_refinement
+                                .accepted_features.length
+                            }{' '}
+                            feature
+                            {parametricRecipe.diagnostics.residual_refinement
+                              .accepted_features.length === 1
+                              ? ''
+                              : 's'}{' '}
+                            accepted
+                            {parametricRecipe.diagnostics.residual_refinement
+                              .beam_width
+                              ? ` · beam width ${parametricRecipe.diagnostics.residual_refinement.beam_width}`
+                              : ''}{' '}
+                            · stopped on{' '}
+                            {parametricRecipe.diagnostics.residual_refinement.stop_reason?.replaceAll(
+                              '_',
+                              ' ',
+                            )}
+                          </small>
+                        )}
+                        {parametricRecipe.diagnostics.surface_analysis && (
+                          <small>
+                            Surface patches:{' '}
+                            {
+                              parametricRecipe.diagnostics.surface_analysis
+                                .counts.plane
+                            }{' '}
+                            planar ·{' '}
+                            {
+                              parametricRecipe.diagnostics.surface_analysis
+                                .counts.cylinder
+                            }{' '}
+                            cylindrical ·{' '}
+                            {
+                              parametricRecipe.diagnostics.surface_analysis
+                                .counts.freeform
+                            }{' '}
+                            freeform ·{' '}
+                            {
+                              parametricRecipe.diagnostics.surface_analysis
+                                .curvature_analysis.bands.length
+                            }{' '}
+                            high-curvature bands
+                          </small>
+                        )}
+                        {parametricRecipe.diagnostics.hypothesis_search && (
+                          <details className="hypothesis-ranking">
+                            <summary>
+                              Chose{' '}
+                              {
+                                parametricRecipe.diagnostics.hypothesis_search
+                                  .selected.hypothesis
+                              }{' '}
+                              from{' '}
+                              {
+                                parametricRecipe.diagnostics.hypothesis_search
+                                  .hypotheses.length
+                              }{' '}
+                              scored hypotheses
+                            </summary>
+                            <ul>
+                              {parametricRecipe.diagnostics.hypothesis_search.hypotheses.map(
+                                (hypothesis) => (
+                                  <li
+                                    key={`${hypothesis.hypothesis}-${hypothesis.axis_index}`}
+                                    className={
+                                      hypothesis.selected ? 'selected' : ''
+                                    }
+                                  >
+                                    {hypothesis.hypothesis} · axis{' '}
+                                    {hypothesis.axis_index} ·{' '}
+                                    IoU{' '}
+                                    {formatNumber(hypothesis.score * 100)}% ·
+                                    local rank{' '}
+                                    {formatNumber(
+                                      hypothesis.selection_score * 100,
+                                    )}
+                                    %
+                                  </li>
+                                ),
+                              )}
+                            </ul>
+                          </details>
+                        )}
+                        {parametricRecipe.diagnostics.deviation?.rms != null && (
                           <small>
                             Mesh → CAD deviation: RMS{' '}
                             {formatNumber(
@@ -1385,6 +1646,21 @@ function App() {
                             {parametricRecipe.unit}
                           </small>
                         )}
+                        {parametricRecipe.diagnostics.agreement
+                          ?.surface_agreement.normal_alignment != null && (
+                          <small>
+                            Surface-normal agreement:{' '}
+                            {formatNumber(
+                              parametricRecipe.diagnostics.agreement
+                                .surface_agreement.normal_alignment * 100,
+                            )}
+                            % · unresolved local regions{' '}
+                            {
+                              parametricRecipe.diagnostics.agreement
+                                .residual_regions.length
+                            }
+                          </small>
+                        )}
                       </span>
                       <button
                         type="button"
@@ -1392,7 +1668,9 @@ function App() {
                         onClick={() => void createSolidWorksExport()}
                         disabled={
                           exportingSolidWorks ||
-                          !parametricRecipe.solidworks_available
+                          !parametricRecipe.solidworks_available ||
+                          parametricRecipe.diagnostics.quality
+                            ?.export_recommended === false
                         }
                       >
                         {exportingSolidWorks
@@ -1409,6 +1687,14 @@ function App() {
                       <p className="review-warning">
                         SolidWorks and its registered desktop API are required
                         to generate a native SLDPRT feature tree.
+                      </p>
+                    )}
+                    {parametricRecipe.diagnostics.quality
+                      ?.export_recommended === false && (
+                      <p className="review-warning">
+                        Editable CAD export is disabled because all recovered
+                        feature trees are below the minimum geometric agreement.
+                        Use mesh STEP while the feature beam is unsupported.
                       </p>
                     )}
                   </div>
@@ -1703,6 +1989,13 @@ function sourceKindLabel(record: MeshRecord) {
     return 'Photogrammetry'
   }
   if (record.provenance.source_kind === 'neural_reconstruction') {
+    if (
+      record.provenance.processing_steps.includes(
+        'triposr_single_image_scaffold',
+      )
+    ) {
+      return 'TripoSR generative scaffold'
+    }
     return 'VGGT neural reconstruction'
   }
   return 'Derived artifact'

@@ -11,6 +11,7 @@ dependencies = [
     "cadquery",
     "fastapi",
     "imageio-ffmpeg",
+    "manifold3d",
     "mapbox-earcut",
     "networkx",
     "numpy",
@@ -34,6 +35,7 @@ vision = [
     "transformers",
     "einops",
     "huggingface_hub",
+    "omegaconf",
     "safetensors",
     "scikit-image",
 ]
@@ -45,9 +47,17 @@ testpaths = ["tests"]
 py-modules = [
     "main",
     "camera_intrinsics",
+    "generative_reconstruction",
+    "mesh_repair",
     "neural_reconstruction",
     "parametric_reconstruction",
     "primitive_fitting",
+    "recipe_selection",
+    "residual_reconstruction",
     "reconstruction",
+    "revolve_reconstruction",
     "segmentation",
+    "solid_agreement",
+    "surface_analysis",
+    "triposr_runner",
 ]

@@ -234,6 +234,37 @@ def test_conservative_repair_does_not_close_holes_by_default(
     assert "fill_small_holes" not in repaired["provenance"]["processing_steps"]
 
 
+def test_watertight_proxy_reports_inference_and_preserves_source(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path)
+
+    with TestClient(main.app) as client:
+        upload = client.post(
+            "/api/meshes",
+            files={"file": ("open-cube.stl", make_open_cube_stl(), "model/stl")},
+        ).json()
+        source_before = client.get(upload["download_url"]).content
+        response = client.post(
+            f"/api/meshes/{upload['id']}/repair",
+            json={
+                "mode": "watertight_proxy",
+                "voxel_resolution": 64,
+                "closing_radius_voxels": 1,
+                "smoothing_iterations": 2,
+            },
+        )
+
+        assert response.status_code == 201
+        proxy = response.json()
+        assert proxy["qualification"]["is_watertight"] is True
+        assert proxy["repair_report"]["method"] == "voxel_wrap"
+        assert proxy["repair_report"]["normalized_rms_percent"] > 0
+        assert proxy["repair_report"]["requires_human_review"] is True
+        assert "watertight_voxel_wrap" in proxy["provenance"]["processing_steps"]
+        assert client.get(upload["download_url"]).content == source_before
+
+
 def test_check_constraint_reports_residual_and_persists(
     monkeypatch, tmp_path
 ) -> None:

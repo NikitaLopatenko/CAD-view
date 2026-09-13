@@ -152,16 +152,19 @@ def find_meshroom_batch() -> Path | None:
 
 
 def reconstruction_capabilities() -> dict[str, object]:
+    from generative_reconstruction import generative_reconstruction_capabilities
     from neural_reconstruction import neural_reconstruction_capabilities
 
     executable = find_meshroom_batch()
     meshroom_available = executable is not None
     neural = neural_reconstruction_capabilities()
+    generative = generative_reconstruction_capabilities()
     neural_available = bool(neural.get("neural_available"))
-    any_engine = meshroom_available or neural_available
+    generative_available = bool(generative.get("generative_available"))
+    any_engine = meshroom_available or neural_available or generative_available
     return {
         "engine": "dual",
-        "engines": ["auto", "meshroom", "vggt"],
+        "engines": ["auto", "meshroom", "vggt", "triposr"],
         "available": any_engine,
         "meshroom_available": meshroom_available,
         "executable": str(executable) if executable else None,
@@ -171,6 +174,7 @@ def reconstruction_capabilities() -> dict[str, object]:
         "provenance_class": "photogrammetry_reconstructed",
         "runtime_root": str(RUNTIME_ROOT),
         **neural,
+        **generative,
     }
 
 

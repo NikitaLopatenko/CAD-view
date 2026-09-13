@@ -20,6 +20,11 @@ frontend/.vite/
 
 tools/
 
+# Oversized CAD binaries (GitHub 100MB limit)
+*.step
+*.STEP
+2607.02515v1.pdf
+
 .env
 .env.*
 !.env.example

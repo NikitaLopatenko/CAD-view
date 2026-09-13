@@ -1,0 +1,26 @@
+CAD-View SolidWorks builder log
+sw_connect=CreateObject
+template=C:\ProgramData\SolidWorks\SOLIDWORKS 2026\templates\Part.prtdot
+doc_title=Part1
+feature_start=1:CADView Outer Extrude
+sketch_start=feature_1_profile
+probe_line=True
+feature_1_profile_outer_points=59
+feature_1_profile_inner_circle_1=attempted
+segments_attempted=59
+segments_non_nothing=60
+sketch_ok=feature_1_profile
+feature_ok=1
+feature_start=2:CADView Perimeter Sweep Cut
+sketch_start=feature_2_path
+probe_line=True
+feature_2_path_outer_points=62
+segments_attempted=61
+segments_non_nothing=61
+sketch_ok=feature_2_path
+sketch_start=feature_2_profile
+probe_line=True
+feature_2_profile_outer_points=9
+segments_attempted=9
+segments_non_nothing=9
+sketch_ok=feature_2_profile

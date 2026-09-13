@@ -1,0 +1,51 @@
+NASAL SPRAY DEMO — photo → STL → CAD
+====================================
+
+Assets in this folder
+- input-photo.png          photo you "start from"
+- reconstruction.stl       full uploaded mesh (demo reconstruction)
+- reconstruction-60k.stl   lighter mesh for STEP export
+- mesh-solid.step          CAD deliverable (open in SolidWorks)
+- parametric-revolve.vbs   NEW: builds a native editable Revolve in SolidWorks
+- recovered-revolve.stl    NEW: the recovered CAD solid, to overlay on the mesh
+- parametric-extrude.SLDPRT  superseded (old bad auto-extrude, kept for contrast)
+
+Suggested live walkthrough
+1. Show input-photo.png — "single image in"
+2. In CAD-View, load reconstruction.stl (or reconstruction-60k.stl)
+   — "neural / scan reconstruction out"
+3. Open mesh-solid.step in SolidWorks
+   — "CAD handoff"
+
+Backend mesh IDs (if app is already running against this machine)
+- Raw upload:           9e0c8e7d-fa99-4661-b4d9-8a51018a3684
+- Scaled ~48 mm tall:   7a42066b-1a2c-40a2-bd9d-11d381085a61
+- 60k + units mm:       9d3494bd-1454-4a5d-b50c-eb31b91c3243
+- Mesh STEP export:     710e7a89-7ad2-4381-9ce8-e9865f2cb770
+  http://127.0.0.1:8000/api/exports/710e7a89-7ad2-4381-9ce8-e9865f2cb770/file
+
+Scale note
+- Source STL height was ~1.90 units; scaled to 48 mm for a believable sleeve size.
+- Diameter ~14 mm after scale. Adjust scale if you want a different physical size.
+
+The editable feature tree (now worth showing)
+- CAD-View builds six hypotheses (extrude and revolve about each principal
+  axis), scores volume, local surface residual, and normal agreement, then
+  executes a parameter search on the winner.
+- For this part it picks a native Revolve about the long axis:
+
+      revolve   axis 2   IoU 0.906   <- selected after radius/profile refinement
+      prismatic axis 2   IoU 0.698
+      prismatic axis 0   IoU 0.662   <- what the old fixed heuristic used
+      prismatic axis 1   IoU 0.554
+      revolve   axis 0   IoU 0.208
+      revolve   axis 1   IoU 0.185
+
+- Old result: one extrude, 47.6% volume error.
+  New result: one revolve, 1.8% volume error, 13-point profile sketch.
+- The robust radius search avoids smearing the asymmetric lip around the whole
+  body. The remaining mismatch is reported as localized residual regions;
+  candidate extra features are rejected when they do not improve the executed
+  solid enough to justify a more complex tree.
+- Run parametric-revolve.vbs on a machine with SolidWorks to get a real
+  feature tree (Sketch + Revolve1) you can edit, not an imported dumb body.

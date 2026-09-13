@@ -18,6 +18,15 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from camera_intrinsics import prepare_shared_camera_model
+from generative_reconstruction import (
+    generative_reconstruction_capabilities,
+    run_triposr_reconstruction,
+)
+from mesh_repair import (
+    MeshRepairError,
+    create_watertight_proxy,
+    fill_boundary_loops,
+)
 from neural_reconstruction import (
     mesh_looks_weak,
     neural_reconstruction_capabilities,
@@ -25,11 +34,11 @@ from neural_reconstruction import (
 )
 from parametric_reconstruction import (
     ParametricReconstructionError,
-    build_prismatic_recipe,
     build_solidworks_part,
     solidworks_available,
     write_solidworks_builder_script,
 )
+from recipe_selection import build_recipe
 from primitive_fitting import analyze_primitives, export_mesh_shape_step, export_step
 from reconstruction import (
     MINIMUM_IMAGE_COUNT,
@@ -114,6 +123,10 @@ class ScaleApplication(BaseModel):
 
 class RepairRequest(BaseModel):
     fill_small_holes: bool = False
+    mode: Literal["conservative", "watertight_proxy"] = "conservative"
+    voxel_resolution: int = Field(default=160, ge=64, le=320)
+    closing_radius_voxels: int = Field(default=2, ge=0, le=8)
+    smoothing_iterations: int = Field(default=6, ge=0, le=30)
 
 
 class RepairReport(BaseModel):
@@ -126,6 +139,16 @@ class RepairReport(BaseModel):
     net_surface_area_change: float
     max_existing_vertex_displacement: float
     requires_human_review: bool
+    method: Literal["conservative", "voxel_wrap"] = "conservative"
+    boundary_loops_filled: int = 0
+    voxel_resolution: int | None = None
+    voxel_pitch: float | None = None
+    closing_radius_voxels: int | None = None
+    smoothing_iterations: int | None = None
+    rms_deviation: float | None = None
+    p95_deviation: float | None = None
+    max_deviation: float | None = None
+    normalized_rms_percent: float | None = None
 
 
 class CheckConstraintRequest(BaseModel):
@@ -167,8 +190,8 @@ class CameraIntrinsicReport(BaseModel):
 
 class ReconstructionJob(BaseModel):
     id: UUID
-    engine: Literal["auto", "meshroom", "vggt"]
-    resolved_engine: Literal["meshroom", "vggt"] | None = None
+    engine: Literal["auto", "meshroom", "vggt", "triposr"]
+    resolved_engine: Literal["meshroom", "vggt", "triposr"] | None = None
     input_kind: Literal["photo_set", "video"]
     status: Literal["queued", "running", "succeeded", "failed"]
     stage: str
@@ -234,6 +257,7 @@ class ParametricRecipeReport(BaseModel):
 
 class SolidWorksExportRequest(BaseModel):
     visible: bool = False
+    allow_approximate: bool = False
 
 
 class SolidWorksExportRecord(BaseModel):
@@ -438,8 +462,12 @@ def _publish_reconstruction_mesh(
     mesh = _load_mesh(mesh_path)
     job_dir, _ = _job_paths(job.id)
     resolved = job.resolved_engine or "meshroom"
-    if resolved == "vggt":
-        processing_steps = ["vggt_neural_reconstruction"]
+    if resolved in {"vggt", "triposr"}:
+        processing_steps = [
+            "vggt_neural_reconstruction"
+            if resolved == "vggt"
+            else "triposr_single_image_scaffold"
+        ]
         source_kind: Literal[
             "mesh_upload", "photogrammetry", "neural_reconstruction", "derived"
         ] = "neural_reconstruction"
@@ -475,9 +503,13 @@ def _publish_reconstruction_mesh(
 
 
 def _resolve_reconstruction_engine(
-    requested: Literal["auto", "meshroom", "vggt"],
-) -> Literal["meshroom", "vggt"]:
-    caps = reconstruction_capabilities() | neural_reconstruction_capabilities()
+    requested: Literal["auto", "meshroom", "vggt", "triposr"],
+) -> Literal["meshroom", "vggt", "triposr"]:
+    caps = (
+        reconstruction_capabilities()
+        | neural_reconstruction_capabilities()
+        | generative_reconstruction_capabilities()
+    )
     meshroom_ok = bool(caps.get("meshroom_available") or caps.get("executable"))
     neural_ok = bool(caps.get("neural_available"))
     if requested == "meshroom":
@@ -490,6 +522,12 @@ def _resolve_reconstruction_engine(
                 "VGGT neural engine requires PyTorch. Install vision extras."
             )
         return "vggt"
+    if requested == "triposr":
+        if not caps.get("generative_available"):
+            raise ReconstructionError(
+                "TripoSR requires PyTorch and the vision dependencies."
+            )
+        return "triposr"
     # auto: classical full-frame SfM first; neural rescues weak/empty dense meshing.
     if meshroom_ok:
         return "meshroom"
@@ -531,7 +569,7 @@ def _run_reconstruction_job(job_id: UUID) -> None:
 
         caps = reconstruction_capabilities()
         if job.engine == "auto":
-            engines_to_try: list[Literal["meshroom", "vggt"]] = []
+            engines_to_try: list[Literal["meshroom", "vggt", "triposr"]] = []
             if caps.get("meshroom_available"):
                 engines_to_try.append("meshroom")
             if caps.get("neural_available"):
@@ -574,19 +612,30 @@ def _run_reconstruction_job(job_id: UUID) -> None:
                         continue
                     generated_path = candidate
                     break
-                job.stage = "neural_reconstruction"
-                _save_job(job)
-                if errors and job.engine in {"auto", "meshroom"}:
-                    # Preserve why classical densification handed off.
-                    job.error = " | ".join(errors)[-500:]
+                if engine_name == "vggt":
+                    job.stage = "neural_reconstruction"
                     _save_job(job)
-                generated_path = run_vggt_reconstruction(
-                    image_dir,
-                    output_dir / "vggt",
-                    mask_dir=mask_dir if mask_dir.is_dir() else None,
-                    log_path=neural_log,
-                    progress=lambda stage: _update_job_stage(job_id, stage),
-                )
+                    if errors and job.engine in {"auto", "meshroom"}:
+                        # Preserve why classical densification handed off.
+                        job.error = " | ".join(errors)[-500:]
+                        _save_job(job)
+                    generated_path = run_vggt_reconstruction(
+                        image_dir,
+                        output_dir / "vggt",
+                        mask_dir=mask_dir if mask_dir.is_dir() else None,
+                        log_path=neural_log,
+                        progress=lambda stage: _update_job_stage(job_id, stage),
+                    )
+                else:
+                    job.stage = "generative_scaffold"
+                    _save_job(job)
+                    generated_path = run_triposr_reconstruction(
+                        image_dir,
+                        output_dir / "triposr",
+                        mask_dir=mask_dir if mask_dir.is_dir() else None,
+                        log_path=job_dir / "triposr.log",
+                        progress=lambda stage: _update_job_stage(job_id, stage),
+                    )
                 break
             except Exception as engine_error:
                 errors.append(f"{engine_name}: {engine_error}")
@@ -670,7 +719,9 @@ def create_photo_reconstruction(
     background_tasks: BackgroundTasks,
     files: Annotated[list[UploadFile], File(...)],
     masks: Annotated[list[UploadFile] | None, File()] = None,
-    engine: Annotated[Literal["auto", "meshroom", "vggt"], Form()] = "auto",
+    engine: Annotated[
+        Literal["auto", "meshroom", "vggt", "triposr"], Form()
+    ] = "auto",
 ) -> ReconstructionJob:
     if len(files) < MINIMUM_IMAGE_COUNT:
         raise HTTPException(
@@ -772,7 +823,9 @@ def create_photo_reconstruction(
 def create_video_reconstruction(
     background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(...)],
-    engine: Annotated[Literal["auto", "meshroom", "vggt"], Form()] = "auto",
+    engine: Annotated[
+        Literal["auto", "meshroom", "vggt", "triposr"], Form()
+    ] = "auto",
 ) -> ReconstructionJob:
     extension = Path(file.filename or "").suffix.lower()
     if extension not in SUPPORTED_VIDEO_EXTENSIONS:
@@ -1130,11 +1183,35 @@ def repair_mesh(mesh_id: UUID, request: RepairRequest) -> MeshRecord:
         steps.append("fix_winding")
 
     faces_before_fill = len(working_mesh.faces)
-    if request.fill_small_holes:
+    boundary_loops_filled = 0
+    if request.mode == "conservative" and request.fill_small_holes:
         trimesh.repair.fill_holes(working_mesh)
+        boundary_fill = fill_boundary_loops(working_mesh)
+        boundary_loops_filled = boundary_fill.loops_filled
     faces_added = int(max(0, len(working_mesh.faces) - faces_before_fill))
     if faces_added:
-        steps.append("fill_small_holes")
+        steps.append("fill_boundary_loops")
+
+    proxy_diagnostics = None
+    if request.mode == "watertight_proxy":
+        try:
+            working_mesh, proxy_diagnostics = create_watertight_proxy(
+                working_mesh,
+                resolution=request.voxel_resolution,
+                closing_radius_voxels=request.closing_radius_voxels,
+                smoothing_iterations=request.smoothing_iterations,
+            )
+        except MeshRepairError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        boundary_loops_filled = proxy_diagnostics.boundary_loops_filled
+        faces_added = int(max(0, len(working_mesh.faces) - faces_before_fill))
+        steps.extend(
+            [
+                "watertight_voxel_wrap",
+                f"closing_radius_{proxy_diagnostics.closing_radius_voxels}_voxels",
+                f"taubin_smooth_{proxy_diagnostics.smoothing_iterations}_iterations",
+            ]
+        )
 
     working_mesh.remove_unreferenced_vertices()
     after = qualify_mesh(working_mesh)
@@ -1147,8 +1224,28 @@ def repair_mesh(mesh_id: UUID, request: RepairRequest) -> MeshRecord:
         winding_reoriented=winding_reoriented,
         fill_small_holes_requested=request.fill_small_holes,
         net_surface_area_change=surface_area_after - surface_area_before,
-        max_existing_vertex_displacement=0.0,
-        requires_human_review=faces_added > 0,
+        max_existing_vertex_displacement=(
+            proxy_diagnostics.max_deviation if proxy_diagnostics else 0.0
+        ),
+        requires_human_review=faces_added > 0 or proxy_diagnostics is not None,
+        method=proxy_diagnostics.method if proxy_diagnostics else "conservative",
+        boundary_loops_filled=boundary_loops_filled,
+        voxel_resolution=(
+            proxy_diagnostics.voxel_resolution if proxy_diagnostics else None
+        ),
+        voxel_pitch=proxy_diagnostics.voxel_pitch if proxy_diagnostics else None,
+        closing_radius_voxels=(
+            proxy_diagnostics.closing_radius_voxels if proxy_diagnostics else None
+        ),
+        smoothing_iterations=(
+            proxy_diagnostics.smoothing_iterations if proxy_diagnostics else None
+        ),
+        rms_deviation=proxy_diagnostics.rms_deviation if proxy_diagnostics else None,
+        p95_deviation=proxy_diagnostics.p95_deviation if proxy_diagnostics else None,
+        max_deviation=proxy_diagnostics.max_deviation if proxy_diagnostics else None,
+        normalized_rms_percent=(
+            proxy_diagnostics.normalized_rms_percent if proxy_diagnostics else None
+        ),
     )
 
     derived_id = uuid4()
@@ -1157,7 +1254,8 @@ def repair_mesh(mesh_id: UUID, request: RepairRequest) -> MeshRecord:
     if not isinstance(exported, bytes):
         raise HTTPException(status_code=500, detail="Could not export repaired mesh.")
 
-    output_name = f"{Path(source_record.provenance.original_filename).stem}-repaired.stl"
+    suffix = "watertight-proxy" if request.mode == "watertight_proxy" else "repaired"
+    output_name = f"{Path(source_record.provenance.original_filename).stem}-{suffix}.stl"
     record = MeshRecord(
         id=derived_id,
         extension=".stl",
@@ -1222,7 +1320,7 @@ def _parametric_recipe_for_mesh(
             ),
         )
     try:
-        recipe = build_prismatic_recipe(_load_mesh(mesh_path), record.unit)
+        recipe = build_recipe(_load_mesh(mesh_path), record.unit)
     except ParametricReconstructionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return record, recipe
@@ -1256,6 +1354,21 @@ def export_solidworks_feature_part(
     request: SolidWorksExportRequest,
 ) -> SolidWorksExportRecord:
     record, recipe = _parametric_recipe_for_mesh(mesh_id)
+    quality = recipe.get("diagnostics", {}).get("quality", {})
+    if (
+        not bool(quality.get("export_recommended", True))
+        and not request.allow_approximate
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Native CAD export was blocked because the best recovered "
+                f"feature tree has agreement {float(recipe['confidence']):.3f}, "
+                f"below the required {float(quality.get('minimum_export_agreement', 0.60)):.2f}. "
+                "Use the mesh STEP fallback or explicitly set "
+                "allow_approximate=true."
+            ),
+        )
     export_id = uuid4()
     directory = EXPORT_DIR / "solidworks"
     part_path = directory / f"{export_id}.SLDPRT"

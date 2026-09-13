@@ -11,6 +11,8 @@ import numpy as np
 import trimesh
 from PIL import Image
 
+from mesh_repair import boundary_edge_count, fill_boundary_loops
+
 RUNTIME_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CAD-View"
 VGGT_ROOT = RUNTIME_ROOT / "vggt"
 VGGT_REPO = "https://github.com/facebookresearch/vggt.git"
@@ -254,6 +256,9 @@ def _clean_surface_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     try:
         trimesh.repair.fix_normals(mesh, multibody=False)
         trimesh.repair.fill_holes(mesh)
+        # Trimesh's conservative helper only fills triangular/quad openings.
+        # TSDF crop boundaries are often larger simple loops.
+        fill_boundary_loops(mesh)
     except Exception:
         pass
     mesh.remove_unreferenced_vertices()
@@ -430,6 +435,12 @@ def _mesh_from_tsdf(
             "VGGT TSDF has no stable zero crossing; refusing to emit another blob."
         )
 
+    # Marching Cubes emits an open boundary when a negative TSDF region reaches
+    # the robust crop box. A positive guard band makes the inference explicit
+    # and keeps the observed surface away from the extraction volume boundary.
+    guard_voxels = 2
+    field = np.pad(field, guard_voxels, mode="constant", constant_values=1.0)
+    lower = lower - guard_voxels * voxel_size
     vertices, faces, _, _ = marching_cubes(
         field,
         level=0.0,
@@ -448,6 +459,8 @@ def _mesh_from_tsdf(
         "observed_voxels": int(observed.sum()),
         "input_depth_samples": int(trusted.sum()),
         "components_after_cleanup": len(mesh.split(only_watertight=False)),
+        "boundary_edges_after_cleanup": boundary_edge_count(mesh),
+        "volume_guard_voxels": guard_voxels,
         "watertight": bool(mesh.is_watertight),
     }
     return mesh, diagnostics
@@ -641,6 +654,20 @@ def run_vggt_reconstruction(
     if log_path is not None:
         log_path.write_text("\n".join(log_chunks), encoding="utf-8")
     report("neural_complete")
+    # Reconstruction jobs are infrequent and other local 3D models share this
+    # consumer GPU. Release VGGT tensors/cache instead of pinning ~8 GB.
+    del (
+        model,
+        predictions,
+        images,
+        mask_images,
+        depth_tensor,
+        confidence_tensor,
+        extrinsic_tensor,
+        intrinsic_tensor,
+    )
+    if device == "cuda":
+        torch.cuda.empty_cache()
     return mesh_path
 
 

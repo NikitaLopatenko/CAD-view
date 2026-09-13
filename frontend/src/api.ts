@@ -69,6 +69,24 @@ export interface RepairReport {
   net_surface_area_change: number
   max_existing_vertex_displacement: number
   requires_human_review: boolean
+  method: 'conservative' | 'voxel_wrap'
+  boundary_loops_filled: number
+  voxel_resolution: number | null
+  voxel_pitch: number | null
+  closing_radius_voxels: number | null
+  smoothing_iterations: number | null
+  rms_deviation: number | null
+  p95_deviation: number | null
+  max_deviation: number | null
+  normalized_rms_percent: number | null
+}
+
+export interface RepairRequest {
+  fill_small_holes: boolean
+  mode: 'conservative' | 'watertight_proxy'
+  voxel_resolution: number
+  closing_radius_voxels: number
+  smoothing_iterations: number
 }
 
 export interface CheckConstraint {
@@ -94,7 +112,7 @@ export interface CheckConstraintRequest {
   tolerance: number
 }
 
-export type ReconstructionEngineChoice = 'auto' | 'meshroom' | 'vggt'
+export type ReconstructionEngineChoice = 'auto' | 'meshroom' | 'vggt' | 'triposr'
 
 export interface ReconstructionCapabilities {
   engine: 'dual' | 'meshroom'
@@ -113,6 +131,11 @@ export interface ReconstructionCapabilities {
   neural_available?: boolean
   neural_source_ready?: boolean
   neural_model?: string
+  generative_engine?: 'triposr'
+  generative_available?: boolean
+  generative_source_ready?: boolean
+  generative_model?: string
+  generative_warning?: string
 }
 
 export interface ForegroundBox {
@@ -141,7 +164,7 @@ export interface CameraIntrinsicReport {
 export interface ReconstructionJob {
   id: string
   engine: ReconstructionEngineChoice
-  resolved_engine: 'meshroom' | 'vggt' | null
+  resolved_engine: 'meshroom' | 'vggt' | 'triposr' | null
   input_kind: 'photo_set' | 'video'
   status: 'queued' | 'running' | 'succeeded' | 'failed'
   stage: string
@@ -180,10 +203,17 @@ export interface StepExportRecord {
 export interface ParametricSketch {
   name: string
   plane: string
-  outer_loop: {
-    kind: 'polyline'
-    points: [number, number][]
-  }
+  outer_loop:
+    | {
+        kind: 'polyline'
+        points: [number, number][]
+      }
+    | {
+        kind: 'circle'
+        center: [number, number]
+        radius: number
+        fit_normalized_rms: number
+      }
   inner_loops: Array<
     | {
         kind: 'circle'
@@ -196,19 +226,40 @@ export interface ParametricSketch {
         points: [number, number][]
       }
   >
+  inferred_constraints?: Array<{
+    type: string
+    entities?: number[]
+    value?: number
+    closed?: boolean
+  }>
 }
 
 export interface ParametricFeature {
   id: string
   name: string
-  type: 'extrude' | 'cut' | 'sweep_cut'
-  depth: number
-  start_offset: number
+  type: 'extrude' | 'cut' | 'sweep_cut' | 'revolve' | 'revolve_cut'
+  /** Absent on revolves/revolve cuts, which are bounded by an angle. */
+  depth?: number
+  start_offset?: number
+  solidworks_start_offset?: number
+  flip_start_offset?: boolean
+  end_condition?: 'midplane'
+  direction_index?: 0 | 1 | 2
+  angle_degrees?: number
+  axis?: {
+    kind: 'sketch_centerline'
+    points: [number, number][]
+  }
   role:
     | 'base'
     | 'perimeter_groove_flange'
     | 'perimeter_groove_cut'
     | 'perimeter_groove_sweep'
+    | 'residual_boss'
+    | 'residual_cut'
+    | 'residual_revolve_cut'
+    | 'radial_hole'
+    | 'perimeter_groove_cut_fallback'
   sketch?: ParametricSketch
   profile?: ParametricSketch
   path?: {
@@ -217,6 +268,15 @@ export interface ParametricFeature {
     kind: 'polyline'
     points: [number, number][]
     closed: boolean
+  }
+  fallback?: {
+    name: string
+    type: 'cut'
+    depth: number
+    start_offset: number
+    end_condition?: 'midplane'
+    role: 'perimeter_groove_cut_fallback'
+    sketch: ParametricSketch
   }
 }
 
@@ -271,16 +331,141 @@ export interface OrthogonalSweepAnalysis {
   hypotheses: FeatureHypothesis[]
 }
 
+/** How closely one candidate solid reproduces the source mesh. */
+export interface AgreementReport {
+  score: number
+  selection_score: number
+  method: 'volume_iou' | 'surface_deviation' | 'unbuildable'
+  volume_iou: number | null
+  deviation: ParametricDeviation
+  surface_agreement: {
+    symmetric_rms: number | null
+    symmetric_p95: number | null
+    symmetric_max: number | null
+    symmetric_tail_rms: number | null
+    normalized_tail_rms: number | null
+    normal_alignment: number | null
+    normal_error_degrees: number | null
+    score: number
+  }
+  residual_regions: Array<{
+    kind: 'missing_material' | 'excess_material'
+    face_count: number
+    area: number
+    area_fraction: number
+    centroid: [number, number, number]
+    bounds: [[number, number, number], [number, number, number]]
+    mean_distance: number
+    max_distance: number
+    dominant_normal: [number, number, number]
+  }>
+  candidate_volume: number | null
+  source_volume: number | null
+  volume_error_percent: number | null
+  detail: string | null
+}
+
+export interface RecipeHypothesis {
+  hypothesis: 'prismatic' | 'revolve' | 'surface_revolve'
+  axis_index: number
+  strategy: string
+  score: number
+  selection_score: number
+  score_method: string | null
+  volume_iou: number | null
+  confidence: number | null
+  feature_count: number
+  volume_error_percent: number | null
+  selected: boolean
+}
+
+export interface HypothesisSearch {
+  selected: {
+    hypothesis: string
+    axis_index: number
+    axis_world?: [number, number, number] | null
+  }
+  score_method: 'volume_iou' | 'surface_deviation'
+  selection_margin: number
+  incumbent: {
+    hypothesis: string
+    axis_index: number
+    score: number | null
+  }
+  hypotheses: RecipeHypothesis[]
+  rejected: { hypothesis: string; axis_index: number; reason: string }[]
+}
+
+/**
+ * Groove and sweep fields only exist on prismatic recipes; a revolve recipe
+ * reports radial diagnostics instead, so every strategy-specific field is
+ * optional and must be guarded before use.
+ */
 export interface ParametricDiagnostics {
-  groove_detected: boolean
-  groove_width: number
-  flange_depth: number
-  section_variation_fraction: number
-  side_symmetry_error: number
-  sweep_candidates: SweepCandidate[]
-  feature_intent: {
+  groove_detected?: boolean
+  groove_width?: number
+  flange_depth?: number
+  section_variation_fraction?: number
+  side_symmetry_error?: number
+  sweep_candidates?: SweepCandidate[]
+  feature_intent?: {
     selected: 'extrude' | 'stacked_cut' | 'sweep_cut'
     orthogonal_section_analysis: OrthogonalSweepAnalysis | null
+  }
+  revolve_axis_index?: number
+  maximum_radius?: number
+  bore_radius?: number
+  roundness_error?: number
+  profile_height?: number
+  profile_point_count?: number
+  agreement?: AgreementReport
+  hypothesis_search?: HypothesisSearch
+  residual_refinement?: {
+    attempted: boolean
+    accepted_features: string[]
+    beam_width?: number
+    iterations: Array<{
+      iteration: number
+      candidate_count: number
+      expanded_parent_count?: number
+      decision: string
+      objective_improvement?: number
+      beam?: Array<{
+        rank: number
+        state_id: string
+        depth: number
+        accepted_feature_ids: string[]
+        last_feature_type: ParametricFeature['type']
+        last_feature_role?: ParametricFeature['role']
+        objective: number
+        agreement: number
+        selection_score: number
+        execution_kernel: string
+        kernel_valid: boolean
+      }>
+    }>
+    stop_reason: string | null
+  }
+  surface_analysis?: {
+    patch_count: number
+    counts: { plane: number; cylinder: number; freeform: number }
+    covered_area_fraction: number
+    curvature_analysis: {
+      threshold_degrees: number | null
+      bands: Array<{
+        id: string
+        face_count: number
+        area_fraction: number
+        mean_angle_degrees: number
+        maximum_angle_degrees: number
+      }>
+    }
+  }
+  quality?: {
+    status: 'high' | 'usable' | 'approximate' | 'unsupported'
+    agreement: number
+    minimum_export_agreement: number
+    export_recommended: boolean
   }
   deviation: ParametricDeviation
   volume_error_percent: number | null
@@ -294,6 +479,8 @@ export interface ParametricRecipeReport {
     | 'prismatic_extrusion'
     | 'multi_section_perimeter_groove'
     | 'sweep_cut_reconstruction'
+    | 'revolve_reconstruction'
+    | 'residual_refined_reconstruction'
   confidence: number
   features: ParametricFeature[]
   diagnostics: ParametricDiagnostics
@@ -387,12 +574,12 @@ export async function scaleMesh(
 
 export async function repairMesh(
   meshId: string,
-  fillSmallHoles: boolean,
+  request: RepairRequest,
 ): Promise<MeshRecord> {
   const response = await fetch(`/api/meshes/${meshId}/repair`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fill_small_holes: fillSmallHoles }),
+    body: JSON.stringify(request),
   })
 
   if (!response.ok) {
