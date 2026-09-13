@@ -25,6 +25,11 @@ tools/
 *.STEP
 2607.02515v1.pdf
 
+# Regenerable demo intermediates
+demo/nasal-spray-base/gallery/frames/
+demo/nasal-spray-base/gallery/ffmpeg-frames.txt
+demo/nasal-spray-base/parametric-result.json
+
 .env
 .env.*
 !.env.example
